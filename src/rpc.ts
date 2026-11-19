@@ -33,8 +33,8 @@ export interface HarnessStatus {
   mode: HarnessMode
   /** The global default mode, regardless of any session override. */
   globalMode: HarnessMode
-  /** The per-session override, or null when the session follows the default. */
-  sessionMode: HarnessMode | null
+  /** The per-session override; "" when the session follows the global default. */
+  sessionMode: "" | HarnessMode
   /** Absolute path of the resolved CLI, "" when not found. */
   bin: string
   /** Whether the resolved CLI was found on disk. */
@@ -67,13 +67,13 @@ const statusSchema = {
   properties: {
     mode: { type: "string" },
     globalMode: { type: "string" },
-    sessionMode: { type: ["string", "null"] },
+    sessionMode: { type: "string" },
     bin: { type: "string" },
     binOk: { type: "boolean" },
     patterns: { type: "array", items: { type: "string" } },
     routed: { type: "number" },
   },
-  required: ["mode", "globalMode", "bin", "binOk", "patterns", "routed"],
+  required: ["mode", "globalMode", "sessionMode", "bin", "binOk", "patterns", "routed"],
 }
 
 const prefsSchema = {

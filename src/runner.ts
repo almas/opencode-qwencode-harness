@@ -32,7 +32,7 @@ export interface RunnerPrefs {
 }
 
 /** Minimal structural view of the model instance we are replacing. */
-interface OriginalModel {
+export interface OriginalModel {
   provider?: string
   modelId?: string
   maxInputTokens?: number
@@ -307,7 +307,7 @@ export function globToRegExp(pattern: string): RegExp {
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, ".*")
     .replace(/\?/g, ".")
-  return new RegExp(`^${escaped}$`)
+  return new RegExp(`^${escaped}$`, "i")
 }
 
 /**

@@ -37,8 +37,6 @@ const DEFAULT_PREFS: HarnessPrefs = {
   timeoutSeconds: 900,
 }
 
-const MODES: HarnessMode[] = ["auto", "always", "off"]
-
 const MODE_KEYS: Record<HarnessMode, string> = {
   auto: "qwencode.mode.auto",
   always: "qwencode.mode.always",
@@ -213,7 +211,9 @@ export default Plugin.define({
           void refreshStatusFor(sessionID)
         }
         const info = sessionStatus()[sessionID] ?? globalStatus()
-        const mode: HarnessMode = info?.sessionMode ?? info?.mode ?? "auto"
+        // `mode` is already the effective mode for this session (server
+        // applies any per-session override); "" in sessionMode = no override.
+        const mode: HarnessMode = info?.mode ?? "auto"
         const mark = (value: HarnessMode) => (value === mode ? "✓ " : "")
         return {
           label: `Qwen: ${ctx.t(MODE_KEYS[mode])}`,

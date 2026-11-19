@@ -1,308 +1,273 @@
 /**
- * QwenCode Harness — route selected models to the QwenCode CLI harness.
+ * QwenCode Harness — the server half of the plugin.
  *
- * When the session's model matches one of the configured patterns (or the
- * mode is set to "always"), this plugin swaps the AI-SDK language model for
- * one whose answers come from a `qwen` CLI process instead of an HTTP API.
- * Everything else — session storage, SSE, the GUI — is untouched, so Qwen
- * models that are broken behind their current proxy keep working: the host
- * UI still believes it talks to the model the user picked.
+ * Redirects OpenCode's own answering step: when the session's model matches
+ * the configured patterns, the `aisdk.hook("language")` event swaps the
+ * language model for a thin wrapper that streams answers from the QwenCode
+ * CLI (`qwen -p --output-format stream-json`) instead of the upstream API.
  *
- * Mode resolution, strongest first:
- *   1. per-session override set from the composer pill (mode ≠ "auto"),
- *   2. the global mode ("always" routes every model, "off" routes none),
- *   3. "auto": the model must match one of the glob patterns.
- *
- * The `language` hook has no session id, so the session is captured in the
- * session-level `model.request` hook, which fires for the same provider call
- * right before the language model is used.
+ * OpenCode still runs the loop, stores messages and renders the transcript;
+ * only the model that produces tokens is replaced. The GUI half configures
+ * mode, binary path and patterns through the `qwencode-harness` RPC domain.
  */
-import { createOpencodePlugin, definePlugin } from "@opencode/plugin/promise"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { Plugin } from "@opencode/plugin"
 
-import { QwenCodeRunner, matchModel } from "./runner"
+import { QwenCodeRunner, matchModel, type OriginalModel } from "./runner"
 import {
   DEFAULT_PATTERNS,
   DEFAULT_QWEN_BIN,
+  HARNESS_MODES,
   QwenCodeHarnessRpc,
   type HarnessMode,
   type HarnessPrefs,
+  type HarnessStatus,
+  type HarnessTest,
 } from "./rpc"
+
+const PREFS_KEY = "qwencode-harness/prefs"
 
 const DEFAULT_PREFS: HarnessPrefs = {
   mode: "auto",
   bin: DEFAULT_QWEN_BIN,
   patterns: [...DEFAULT_PATTERNS],
+  // Read-only tools plus Bash; the CLI runs unsupervised, so keep this tight.
   allowedTools: ["Read", "Grep", "Glob", "Bash"],
   timeoutSeconds: 900,
 }
 
-/** Prefer an explicit path; otherwise resolve `qwen` through the usual PATHs. */
-const BIN_CANDIDATES = [
-  "/home/dd/.local/bin/qwen",
+/** Candidate locations probed when the configured path is not executable. */
+const FALLBACK_BINS = [
+  "~/.local/bin/qwen",
+  "~/.npm-global/bin/qwen",
+  "~/.volta/bin/qwen",
   "/usr/local/bin/qwen",
   "/usr/bin/qwen",
-  "/bin/qwen",
+  "/opt/homebrew/bin/qwen",
 ]
 
-const GLOBS = ["*"]
+function expandHome(input: string): string {
+  if (input === "~") return os.homedir()
+  if (input.startsWith("~/")) return path.join(os.homedir(), input.slice(2))
+  return input
+}
 
 function describe(error: unknown): string {
   if (error instanceof Error) return error.message
-  try {
-    return String(error)
-  } catch {
-    return "unknown error"
-  }
+  return String(error)
 }
 
-/** `providerID/…/modelID` — everything matchModel may want to probe. */
-function describeModelPath(model: unknown): string {
-  const m = model as Record<string, any> | undefined
-  const apiId = typeof m?.api?.id === "string" ? m.api.id : ""
-  const id = typeof m?.id === "string" ? m.id : ""
-  const provider = typeof m?.providerID === "string" ? m.providerID : ""
-  const modelID = apiId || id
-  if (modelID && provider) return `${provider}/${modelID}`
-  return modelID || provider
+function isMode(value: unknown): value is HarnessMode {
+  return typeof value === "string" && (HARNESS_MODES as readonly string[]).includes(value)
 }
 
-async function resolveQwenBin(prefs: HarnessPrefs): Promise<string | null> {
-  const fs = await import("node:fs")
-  const path = await import("node:path")
-  const candidates = [
-    ...(prefs.bin ? [prefs.bin] : []),
-    ...BIN_CANDIDATES,
-    ...(process.env.PATH ?? "")
-      .split(path.delimiter)
-      .filter(Boolean)
-      .map((dir) => path.join(dir, "qwen")),
-    ...GLOBS.flatMap((glob) => {
-      if (glob.includes("/")) return [glob]
-      return [
-        path.join(process.env.HOME ?? "", ".local", "bin", glob),
-        path.join(process.env.HOME ?? "", "bin", glob),
-      ]
-    }),
-  ]
-  for (const candidate of candidates) {
-    if (!candidate) continue
-    try {
-      const stat = await fs.promises.stat(candidate)
-      if (stat.isFile()) return candidate
-    } catch {
-      /* keep looking */
-    }
-  }
-  return null
-}
+const TEST_PROMPT = "Reply with exactly: PONG"
 
-export default definePlugin({
+export default Plugin.define({
   id: "qwencode-harness",
-  name: "QwenCode Harness",
-  server: createOpencodePlugin({
-    async trigger(ctx) {
-      const storage = (ctx as any).storage as {
-        read(key: readonly string[]): Promise<unknown>
-        write(key: readonly string[], data: unknown): Promise<void>
+  async setup(ctx) {
+    // ---------- preferences ----------
+    const loadPrefs = async (): Promise<HarnessPrefs> => {
+      let stored: (Partial<HarnessPrefs> & { enabled?: unknown }) | undefined
+      try {
+        stored = (await ctx.storage.get(PREFS_KEY)) as (Partial<HarnessPrefs> & { enabled?: unknown }) | undefined
+      } catch {
+        return { ...DEFAULT_PREFS }
       }
-      const processSvc = (ctx as any).process as {
-        run(input: {
-          command: string
-          args: string[]
-          cwd: string
-          timeout: number
-        }): Promise<{ text: () => Promise<string> }>
-      }
-
-      const prefs: HarnessPrefs = { ...DEFAULT_PREFS }
-
-      const load = async () => {
+      if (!stored || typeof stored !== "object") return { ...DEFAULT_PREFS }
+      const merged: HarnessPrefs = { ...DEFAULT_PREFS, ...stored }
+      if (!isMode(merged.mode)) merged.mode = DEFAULT_PREFS.mode
+      if (!merged.bin) merged.bin = DEFAULT_PREFS.bin
+      if (!Array.isArray(merged.patterns) || merged.patterns.length === 0)
+        merged.patterns = [...DEFAULT_PATTERNS]
+      if (!Array.isArray(merged.allowedTools)) merged.allowedTools = [...DEFAULT_PREFS.allowedTools]
+      if (!Number.isFinite(merged.timeoutSeconds) || merged.timeoutSeconds < 30)
+        merged.timeoutSeconds = DEFAULT_PREFS.timeoutSeconds
+      // Migrate the old boolean switch onto the mode ladder (true → auto).
+      if (typeof stored.enabled === "boolean" && stored.mode === undefined) {
+        merged.mode = stored.enabled ? "auto" : "off"
         try {
-          const stored = (await storage.read(["qwencode-harness", "prefs"])) as
-            | Partial<HarnessPrefs>
-            | undefined
-          if (stored && typeof stored === "object") {
-            Object.assign(prefs, DEFAULT_PREFS, stored)
+          await ctx.storage.set(PREFS_KEY, { ...merged })
+        } catch {
+          /* prefs stay in memory for this run */
+        }
+      }
+      return merged
+    }
+
+    let prefs = await loadPrefs()
+    const savePrefs = async () => {
+      try {
+        await ctx.storage.set(PREFS_KEY, { ...prefs })
+      } catch (error) {
+        console.warn("[qwencode-harness] prefs save failed:", describe(error))
+      }
+    }
+
+    // ---------- binary discovery ----------
+    let binCache: string | null | undefined
+    const resolveBin = async (): Promise<string | null> => {
+      if (binCache !== undefined) return binCache
+      const configured = expandHome(prefs.bin.trim())
+      const names = configured ? [configured] : []
+      for (const fallback of FALLBACK_BINS) {
+        const candidate = expandHome(fallback)
+        if (!names.includes(candidate)) names.push(candidate)
+      }
+      const fromPath = (process.env.PATH ?? "")
+        .split(path.delimiter)
+        .filter(Boolean)
+        .map((dir) => path.join(dir, "qwen"))
+      for (const candidate of [...names, ...fromPath]) {
+        if (!candidate) continue
+        try {
+          const stat = await fs.promises.stat(candidate)
+          if (stat.isFile()) {
+            binCache = candidate
+            return candidate
           }
-          // Migrate the old boolean switch onto the mode ladder.
-          const legacy = stored as { enabled?: unknown } | undefined
-          if (legacy && typeof legacy.enabled === "boolean" && !("mode" in legacy)) {
-            prefs.mode = legacy.enabled ? "auto" : "off"
-            await storage.write(["qwencode-harness", "prefs"], { ...prefs })
+        } catch {
+          /* keep looking */
+        }
+      }
+      binCache = null
+      return null
+    }
+
+    // ---------- routing state ----------
+    /** Per-session mode overrides; empty means "follow prefs.mode". */
+    const sessionModes = new Map<string, HarnessMode>()
+    /**
+     * The session whose model is being resolved right now. `model.request`
+     * fires a moment before the language model is built; the language hook
+     * itself carries no sessionID, so this is the only correlation point.
+     */
+    let currentSessionID = ""
+    let routedCount = 0
+
+    const effectiveMode = (sessionID: string): HarnessMode =>
+      sessionModes.get(sessionID) ?? prefs.mode
+
+    const buildStatus = (sessionID?: string): HarnessStatus => {
+      const id = sessionID ?? ""
+      const sessionMode = sessionModes.get(id) ?? null
+      return {
+        mode: effectiveMode(id),
+        globalMode: prefs.mode,
+        sessionMode: sessionMode ?? "",
+        bin: "",
+        binOk: false,
+        patterns: [...prefs.patterns],
+        routed: routedCount,
+      }
+    }
+
+    // One shared runner; it reads prefs live, so changes apply to the next turn.
+    const runner = new QwenCodeRunner({
+      getPrefs: () => ({
+        bin: prefs.bin,
+        allowedTools: prefs.allowedTools,
+        timeoutSeconds: prefs.timeoutSeconds,
+      }),
+      resolveBin: async () => (await resolveBin()) ?? "",
+    })
+
+    // ---------- RPC ----------
+    await ctx.rpc.register(QwenCodeHarnessRpc, {
+      status: async (raw): Promise<HarnessStatus> => {
+        const sessionID = (raw as { sessionID?: string } | undefined)?.sessionID
+        const bin = await resolveBin()
+        return { ...buildStatus(sessionID), bin: bin ?? "", binOk: bin !== null }
+      },
+      setMode: async (raw): Promise<HarnessStatus> => {
+        const input = raw as { sessionID?: string; mode?: string | null } | undefined
+        const sessionID = input?.sessionID ?? ""
+        if (!isMode(input?.mode)) sessionModes.delete(sessionID)
+        else sessionModes.set(sessionID, input!.mode as HarnessMode)
+        const bin = await resolveBin()
+        return { ...buildStatus(sessionID), bin: bin ?? "", binOk: bin !== null }
+      },
+      prefs: async (): Promise<HarnessPrefs> => ({ ...prefs }),
+      setPrefs: async (raw): Promise<HarnessPrefs> => {
+        const patch = (raw ?? {}) as Partial<HarnessPrefs>
+        if (isMode(patch.mode)) prefs.mode = patch.mode
+        if (typeof patch.bin === "string") {
+          prefs.bin = patch.bin.trim() || DEFAULT_QWEN_BIN
+          binCache = undefined
+        }
+        if (Array.isArray(patch.patterns) && patch.patterns.length > 0)
+          prefs.patterns = patch.patterns.map(String)
+        if (Array.isArray(patch.allowedTools)) prefs.allowedTools = patch.allowedTools.map(String)
+        if (Number.isFinite(patch.timeoutSeconds))
+          prefs.timeoutSeconds = Math.max(30, Math.floor(patch.timeoutSeconds as number))
+        await savePrefs()
+        return { ...prefs }
+      },
+      test: async (): Promise<HarnessTest> => {
+        const bin = await resolveBin()
+        if (!bin)
+          return {
+            bin: "",
+            ok: false,
+            detail: `QwenCode CLI not found (tried ${[prefs.bin, ...FALLBACK_BINS].join(", ")})`,
+          }
+        try {
+          const model = runner.asLanguageModel(
+            { provider: "qwencode", modelId: "qwen-test", maxInputTokens: 32_000 },
+            "qwen-test",
+          ) as { doGenerate: (o: { prompt: string }) => Promise<{ content: Array<{ type: string; text?: string }> }> }
+          const result = await model.doGenerate({ prompt: TEST_PROMPT })
+          const text = result.content
+            .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+            .join("")
+            .trim()
+          return {
+            bin,
+            ok: text.length > 0,
+            detail: text.length > 200 ? `${text.slice(0, 200)}…` : text || "empty reply (check the API key)",
           }
         } catch (error) {
-          console.warn("[qwencode-harness] prefs load failed:", describe(error))
+          return { bin, ok: false, detail: describe(error) }
         }
-      }
-      const save = async () => {
-        try {
-          await storage.write(["qwencode-harness", "prefs"], { ...prefs })
-        } catch (error) {
-          console.warn("[qwencode-harness] prefs save failed:", describe(error))
-        }
-      }
-      await load()
+      },
+    })
 
-      const binCache = { value: undefined as string | null | undefined }
-      const getBin = async () => {
-        if (binCache.value === undefined) binCache.value = await resolveQwenBin(prefs)
-        return binCache.value
-      }
-      const clearBinCache = () => {
-        binCache.value = undefined
-      }
+    // ---------- harness hooks ----------
+    // Remember which session is about to make a model request: the language
+    // hook below has no sessionID of its own.
+    await ctx.session.hook("model.request", (event) => {
+      currentSessionID = String((event as { sessionID?: unknown }).sessionID ?? "")
+    })
 
-      // Per-session overrides set from the composer pill. In-memory: they
-      // apply to the running server and reset when it restarts.
-      const sessionModes = new Map<string, HarnessMode>()
-      // The session of the provider call currently being prepared. Set in
-      // `model.request`, read by the `language` hook moments later.
-      let currentSessionID: string | undefined
-      let routed = 0
+    await ctx.aisdk.hook("language", (input) => {
+      const info = input.model as unknown as
+        | { id?: string; api?: { id?: string }; providerID?: string }
+        | undefined
+      const modelPath = String(info?.api?.id ?? info?.id ?? info?.providerID ?? "")
 
-      const effectiveMode = (modelPath: string, sessionID?: string): HarnessMode => {
-        const sessionMode = sessionID ? sessionModes.get(sessionID) : undefined
-        if (sessionMode === "always" || sessionMode === "off") return sessionMode
-        if (prefs.mode === "always") {
-          // Never hijack OpenCode's own helper models (titles, summaries).
-          return modelPath.toLowerCase().startsWith("opencode") ? "off" : "always"
-        }
-        if (prefs.mode === "off") return "off"
-        return matchModel(modelPath, prefs.patterns) ? "auto" : "off"
+      const sessionMode = sessionModes.get(currentSessionID)
+      if (sessionMode === "off") return
+      const mode = sessionMode ?? prefs.mode
+      if (mode === "off") return
+      if (mode === "auto" && !matchModel(modelPath, prefs.patterns)) return
+      // "always" must not hijack OpenCode's built-in helper models (titles,
+      // summaries, compaction): those providers are not user chats.
+      if (modelPath.toLowerCase().startsWith("opencode")) return
+
+      const original: OriginalModel = {
+        provider: info?.providerID ?? "qwencode",
+        modelId: modelPath || "qwencode",
+        maxInputTokens:
+          Number((info as { limit?: { context?: unknown } } | undefined)?.limit?.context) || 128_000,
       }
 
-      const runner = new QwenCodeRunner({
-        getPrefs: () => ({
-          bin: prefs.bin,
-          allowedTools: prefs.allowedTools,
-          timeoutSeconds: prefs.timeoutSeconds,
-        }),
-        resolveBin: getBin,
-      })
-
-      const rpc = (ctx as any).rpc as {
-        register(definitions: Record<string, any>): void
-      }
-
-      rpc.register({
-        [QwenCodeHarnessRpc.status]: async (input: { sessionID?: string } | undefined) => {
-          const bin = await getBin()
-          const sessionMode = input?.sessionID ? sessionModes.get(input.sessionID) : undefined
-          return {
-            mode: sessionMode ?? prefs.mode,
-            globalMode: prefs.mode,
-            sessionMode: sessionMode ?? null,
-            bin: bin ?? "",
-            binOk: Boolean(bin),
-            patterns: [...prefs.patterns],
-            routed,
-          }
-        },
-        [QwenCodeHarnessRpc.setMode]: async (
-          input: { sessionID?: string; mode: HarnessMode | null } | undefined,
-        ) => {
-          if (!input) throw new Error("missing input")
-          if (input.sessionID) {
-            if (input.mode === null) sessionModes.delete(input.sessionID)
-            else if (input.mode === "auto" || input.mode === "always" || input.mode === "off") {
-              sessionModes.set(input.sessionID, input.mode)
-            } else throw new Error(`unknown mode: ${String(input.mode)}`)
-          } else if (input.mode === "auto" || input.mode === "always" || input.mode === "off") {
-            prefs.mode = input.mode
-            await save()
-          } else {
-            throw new Error(`unknown mode: ${String(input.mode)}`)
-          }
-          const bin = await getBin()
-          return {
-            mode: prefs.mode,
-            globalMode: prefs.mode,
-            sessionMode: input?.sessionID ? sessionModes.get(input.sessionID) ?? null : null,
-            bin: bin ?? "",
-            binOk: Boolean(bin),
-            patterns: [...prefs.patterns],
-            routed,
-          }
-        },
-        [QwenCodeHarnessRpc.prefs]: async () => ({ ...prefs }),
-        [QwenCodeHarnessRpc.setPrefs]: async (patch: Partial<HarnessPrefs> | undefined) => {
-          Object.assign(prefs, DEFAULT_PREFS, patch ?? {}, {
-            patterns:
-              Array.isArray(patch?.patterns) && patch!.patterns.length > 0
-                ? patch!.patterns
-                : prefs.patterns,
-            allowedTools: Array.isArray(patch?.allowedTools)
-              ? patch!.allowedTools
-              : prefs.allowedTools,
-          })
-          if (patch && "bin" in patch) clearBinCache()
-          await save()
-          return { ...prefs }
-        },
-        [QwenCodeHarnessRpc.test]: async () => {
-          const bin = await getBin()
-          if (!bin) {
-            return { bin: "", ok: false, detail: `qwen not found (looked in ${BIN_CANDIDATES.join(", ")} and PATH)` }
-          }
-          try {
-            const handle = await processSvc.run({
-              command: bin,
-              args: ["-p", "--no-session-persistence", "Reply with exactly: PONG"],
-              cwd: process.env.HOME ?? "/",
-              timeout: 120_000,
-            })
-            const text = await handle.text()
-            const ok = /PONG/i.test(text)
-            return { bin, ok, detail: text.trim().slice(0, 400) || "(empty reply)" }
-          } catch (error) {
-            return { bin, ok: false, detail: describe(error).slice(0, 400) }
-          }
-        },
-      })
-
-      ctx.register({
-        // Fired per model call, with the session id the `language` hook lacks.
-        // Remember the session so per-session modes can be applied there.
-        "model.request": (input: { sessionID?: string }) => {
-          if (typeof input?.sessionID === "string") currentSessionID = input.sessionID
-        },
-
-        // Replace the language model for harness-routed calls. Returning the
-        // harness via output.language swaps the model instance; the host then
-        // streams our process' output as if it were the API's.
-        language: (input: any, output: any) => {
-          const modelPath = describeModelPath(input.model)
-          const mode = effectiveMode(modelPath, currentSessionID)
-          if (mode === "off") return
-          if (!output.language) {
-            console.warn(
-              "[qwencode-harness] language hook ran without a model instance; skipping",
-            )
-            return
-          }
-
-          const original = input.model as Record<string, any>
-          const harness = runner.asLanguageModel(
-            {
-              provider: original?.providerID ?? "qwencode",
-              modelId: original?.api?.id ?? original?.id ?? modelPath,
-              maxInputTokens: original?.limit?.context,
-            },
-            modelPath,
-          )
-          routed += 1
-          console.info(
-            `[qwencode-harness] routing ${modelPath} via ${binCache.value ?? prefs.bin} (mode=${mode}, session=${currentSessionID ?? "?"})`,
-          )
-          output.language = harness
-        },
-      })
-
-      ctx.lifecycle.register({
-        async dispose() {
-          await save()
-        },
-      })
-    },
-  }),
+      // The wrapper rebuilds the transcript from the messages OpenCode
+      // assembled, so the CLI sees the same conversation the UI shows.
+      const wrapper = runner.asLanguageModel(original, modelPath || "qwencode")
+      routedCount += 1
+      ;(input as unknown as { language?: unknown }).language = wrapper
+    })
+  },
 })
