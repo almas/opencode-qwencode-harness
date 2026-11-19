@@ -1,0 +1,40 @@
+{
+  "name": "opencode-qwencode-harness",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Qwen 系モデルの応答を QwenCode CLI（ハーネス）へ自動で切り替える OpenCode プラグイン",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/almas/opencode-qwencode-harness.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "qwencode",
+    "harness",
+    "qwen"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./rpc": "./src/rpc.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "dependencies": {
+    "@opencode/plugin": "2.3.0"
+  },
+  "devDependencies": {
+    "solid-js": "^1.9.0",
+    "typescript": "^5.6.0",
+    "vite": "^7.0.0",
+    "vite-plugin-solid": "^2.11.0",
+    "vitest": "^3.2.7"
+  },
+  "scripts": {
+    "test": "vitest run"
+  }
+}
